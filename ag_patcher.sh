@@ -27,6 +27,12 @@
 #      bash ag_patcher.sh patch
 #      bash ag_patcher.sh unpatch
 #      bash ag_patcher.sh status
+#      bash ag_patcher.sh watch
+#      bash ag_patcher.sh install-watch
+#      bash ag_patcher.sh uninstall-watch
+#  Лишние пути вместо поиска. AG_ROOT — ещё один корень установки.
+#  AG_YES=1 без вопросов. AG_WATCH_ONCE=1 — один проход сторожа.
+#  Windows: ag_patcher.ps1 (perl там нет).
 # ============================================================================
 
 export AG_FROM="ineligible"
@@ -283,7 +289,8 @@ NL='
 add_to() {
   local var="$1" f="$2" real list
   [ -f "$f" ] || return 0
-  case "$f" in *.agtmp*|*.ag_backup) return 0;; esac
+  case "$f" in *.agtmp*|*.ag_backup|*.old.*|*.tmp.*|*AppImage*|*appimage*) return 0;; esac
+  case "$f" in /snap/*|/var/lib/snapd/*) return 0;; esac
   real=$(canon "$f")
   eval "list=\$$var"
   case "$NL$list" in *"$NL$real$NL"*) return 0;; esac
@@ -293,7 +300,8 @@ add_to() {
 add_candidate() {
   local f="$1"
   [ -f "$f" ] || return 0
-  case "$f" in *.agtmp*|*.ag_backup) return 0;; esac
+  case "$f" in *.agtmp*|*.ag_backup|*.old.*|*.tmp.*|*AppImage*|*appimage*) return 0;; esac
+  case "$f" in /snap/*|/var/lib/snapd/*) return 0;; esac
   is_native "$f" || return 0
   add_to CANDIDATES "$f"
 }
@@ -306,7 +314,7 @@ scan_dir() {
   while IFS= read -r f; do
     [ -n "$f" ] && add_candidate "$f"
   done <<EOF
-$(find "$d" -maxdepth "$2" -type f \( -name 'language_server*' -o -name 'agy' -o -name 'agy_*' \) ! -name '*.agtmp*' ! -name '*.ag_backup' 2>/dev/null)
+$(find "$d" -maxdepth "$2" -type f \( -name 'language_server*' -o -name 'agy' -o -name 'agy_*' \) ! -name '*.agtmp*' ! -name '*.ag_backup' ! -name '*.old.*' ! -name '*.tmp.*' 2>/dev/null)
 EOF
 }
 
@@ -318,8 +326,116 @@ add_install() {
   scan_dir "$root" 8
   add_js "$root/Contents/Resources/app/out/main.js"
   add_js "$root/Contents/Resources/app/extensions/antigravity/dist/extension.js"
+  add_js "$root/Contents/resources/app/out/main.js"
+  add_js "$root/Contents/resources/app/extensions/antigravity/dist/extension.js"
   add_js "$root/resources/app/out/main.js"
   add_js "$root/resources/app/extensions/antigravity/dist/extension.js"
+}
+
+# Корень от language_server. Слишком общий каталог не берём: scan_dir от /opt
+# обошёл бы весь префикс.
+root_from_ls() {
+  local f="$1" root
+  case "$f" in
+    */resources/app/extensions/antigravity/bin/*) root="${f%%/resources/app/extensions/antigravity/bin/*}" ;;
+    */Contents/Resources/app/extensions/antigravity/bin/*) root="${f%%/Contents/Resources/app/extensions/antigravity/bin/*}" ;;
+    */Contents/resources/app/extensions/antigravity/bin/*) root="${f%%/Contents/resources/app/extensions/antigravity/bin/*}" ;;
+    */Contents/Resources/bin/*) root="${f%%/Contents/Resources/bin/*}" ;;
+    */Contents/resources/bin/*) root="${f%%/Contents/resources/bin/*}" ;;
+    */resources/bin/*) root="${f%%/resources/bin/*}" ;;
+    *) root=$(dirname "$f") ;;
+  esac
+  case "$root" in
+    /|/usr|/usr/lib|/usr/share|/usr/local|/usr/local/share|/opt|/opt/homebrew|/home|"$USER_HOME"|"") return 1 ;;
+  esac
+  printf '%s\n' "$root"
+}
+
+# Глубина как у Asalio: каталоги до 6, файл внутри — седьмой уровень.
+# Иначе IDE resources/app/extensions/antigravity/bin/language_server не виден.
+walk_base() {
+  local base="$1" f root ext
+  [ -d "$base" ] || return 0
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      *AppImage*|*appimage*|/snap/*|/var/lib/snapd/*) continue ;;
+    esac
+    case "$f" in
+      */resources/app/out/main.js|*/Contents/Resources/app/out/main.js|*/Contents/resources/app/out/main.js)
+        add_js "$f"
+        ext="${f%/out/main.js}/extensions/antigravity/dist/extension.js"
+        add_js "$ext"
+        continue
+        ;;
+    esac
+    case "$(basename "$f")" in
+      language_server*) ;;
+      *) continue ;;
+    esac
+    case "$f" in
+      *[Aa]ntigravity*|*/resources/bin/*|*/Contents/Resources/bin/*|*/Contents/resources/bin/*) ;;
+      *) continue ;;
+    esac
+    add_candidate "$f"
+    root=$(root_from_ls "$f") || true
+    [ -n "$root" ] && add_install "$root"
+  done <<EOF
+$(find "$base" -maxdepth 7 \
+  \( -type d \( -name .git -o -name node_modules -o -name .cache -o -name proc -o -name sys \) \) -prune -o \
+  -type f \( -name 'language_server*' -o -name 'main.js' \) -print 2>/dev/null)
+EOF
+}
+
+collect_pkg_files() {
+  local pkg out f root
+  if command -v dpkg >/dev/null 2>&1; then
+    for pkg in antigravity antigravity-ide; do
+      out=$(dpkg -L "$pkg" 2>/dev/null || true)
+      [ -n "$out" ] || continue
+      while IFS= read -r f; do
+        case "$f" in
+          */language_server*)
+            add_candidate "$f"
+            root=$(root_from_ls "$f") || true
+            [ -n "$root" ] && add_install "$root"
+            ;;
+        esac
+      done <<EOF
+$out
+EOF
+    done
+  fi
+  if command -v rpm >/dev/null 2>&1; then
+    for pkg in antigravity antigravity-ide; do
+      out=$(rpm -ql "$pkg" 2>/dev/null || true)
+      [ -n "$out" ] || continue
+      while IFS= read -r f; do
+        case "$f" in
+          */language_server*)
+            add_candidate "$f"
+            root=$(root_from_ls "$f") || true
+            [ -n "$root" ] && add_install "$root"
+            ;;
+        esac
+      done <<EOF
+$out
+EOF
+    done
+  fi
+}
+
+use_only_paths() {
+  CANDIDATES=""
+  JS_CANDIDATES=""
+  local f
+  for f in "$@"; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      *.js) add_js "$f" ;;
+      *) add_candidate "$f" ;;
+    esac
+  done
 }
 
 collect_candidates() {
@@ -327,18 +443,21 @@ collect_candidates() {
   JS_CANDIDATES=""
   local b d p name
 
+  [ -n "${AG_ROOT:-}" ] && add_install "$AG_ROOT"
+
   if [ "$IS_DARWIN" -eq 1 ]; then
     for b in /Applications/*[Aa]ntigravity*.app "$USER_HOME"/Applications/*[Aa]ntigravity*.app; do
       add_install "$b"
     done
   else
     for d in /opt /usr/share /usr/lib /usr/local /usr/local/share \
-             "$USER_HOME/.local/share" "$USER_HOME"; do
+             "$USER_HOME/.local/share" "$USER_HOME/opt" "$USER_HOME/.antigravity" "$USER_HOME"; do
       [ -d "$d" ] || continue
       for name in Antigravity "Antigravity IDE" antigravity antigravity-ide; do
         add_install "$d/$name"
       done
       # Имя, которое не захардкодили (как scan_antigravity_dirs в оригинале).
+      # Точечные каталоги (~/.antigravity) маска не видит — они заданы выше.
       for b in "$d"/*[Aa]ntigravity*; do
         add_install "$b"
       done
@@ -346,6 +465,16 @@ collect_candidates() {
     add_install "$USER_HOME/.agy"
     add_install "$USER_HOME/.agy/bin"
     add_install "$USER_HOME/.local/share/agy/bin"
+    add_install "$USER_HOME/.gemini/bin"
+  fi
+
+  if [ "$IS_DARWIN" -eq 1 ]; then
+    add_install "$USER_HOME/.agy"
+    add_install "$USER_HOME/.agy/bin"
+    add_install "$USER_HOME/.local/share/agy/bin"
+    add_install "$USER_HOME/.gemini/bin"
+    add_install "$USER_HOME/opt"
+    add_install "$USER_HOME/.antigravity"
   fi
 
   for p in "$USER_HOME/.gemini/bin/agy" "$USER_HOME/.agy/bin/agy" \
@@ -353,11 +482,20 @@ collect_candidates() {
            /usr/local/bin/agy /usr/bin/agy /opt/homebrew/bin/agy \
            "$(command -v agy 2>/dev/null)"; do
     [ -n "$p" ] || continue
-    case "$p" in /snap/*) continue;; esac
+    case "$p" in /snap/*|/var/lib/snapd/*) continue;; esac
     add_candidate "$p"
   done
 
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    case "$d" in /snap|/snap/*|/var/lib/snapd|/var/lib/snapd/*) continue;; esac
+    add_candidate "$d/agy"
+  done <<EOF
+$(printf '%s\n' "$PATH" | tr ':' '\n')
+EOF
+
   for d in "$USER_HOME"/.vscode/extensions "$USER_HOME"/.vscode-insiders/extensions \
+           "$USER_HOME"/.vscode-oss/extensions \
            "$USER_HOME"/.vscode-server/extensions "$USER_HOME"/.cursor/extensions \
            "$USER_HOME"/.cursor-server/extensions "$USER_HOME"/.windsurf/extensions \
            "$USER_HOME"/.trae/extensions "$USER_HOME"/.vscodium/extensions \
@@ -368,6 +506,12 @@ collect_candidates() {
       [ -d "$b" ] && scan_dir "$b" 4
     done
   done
+
+  for d in /opt /usr/share /usr/lib /usr/local /usr/local/share \
+           "$USER_HOME/.local/share" "$USER_HOME/opt" "$USER_HOME/.antigravity" "$USER_HOME"; do
+    walk_base "$d"
+  done
+  collect_pkg_files
 }
 
 label_for() {
@@ -459,31 +603,136 @@ bundle_of() {
 }
 
 # ------------------------------------------------------------------ процессы
-stop_servers() {
-  pkill -f "language_server" 2>/dev/null
-  pkill -f "/agy" 2>/dev/null
-  sleep 1
+# Свой процесс и его родители: иначе путь репозитория antigravity-patcher
+# и аргумент .../agy выглядят как само приложение.
+in_self_tree() {
+  local pid="$1" cur=$$
+  while [ -n "$cur" ] && [ "$cur" -gt 1 ] 2>/dev/null; do
+    [ "$pid" = "$cur" ] && return 0
+    cur=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ' || true)
+    [ -z "$cur" ] && return 1
+  done
+  return 1
 }
 
-running_apps() {
-  local f b seen=""
+# 0 — файл занят исполняющимся процессом (ETXTBSY).
+file_busy() {
+  perl -e 'open(my $fh, "+<", $ARGV[0]) and do { close $fh; exit 1 }; exit($!{ETXTBSY} ? 0 : 1);' -- "$1"
+}
+
+is_editor_exe() {
+  case "$(basename "$1")" in
+    Code|Code.exe|Cursor|Cursor.exe|code|cursor|codium|vscodium) return 0 ;;
+  esac
+  return 1
+}
+
+# Desktop или IDE на шесть уровней выше файла. CLI agy сюда не попадает.
+owner_app() {
+  local f="$1" dir i cand
   if [ "$IS_DARWIN" -eq 1 ]; then
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      b=$(bundle_of "$f"); [ -n "$b" ] || continue
-      case "$NL$seen" in *"$NL$b$NL"*) continue;; esac
-      if pgrep -f "$b/Contents/MacOS/" >/dev/null 2>&1; then
-        seen="$seen$b$NL"
-        echo "$b"
-      fi
-    done <<EOF
-$(all_targets)
-EOF
-  else
-    if pgrep -af -i 'antigravity|language_server' 2>/dev/null | grep -v 'ag_patcher' >/dev/null; then
-      echo "Antigravity (linux)"
-    fi
+    bundle_of "$f"
+    return 0
   fi
+  dir=$(dirname "$(canon "$f")")
+  i=0
+  while [ "$i" -lt 6 ] && [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    for cand in "$dir/antigravity" "$dir/Antigravity" "$dir/Antigravity IDE" "$dir/antigravity-ide"; do
+      if [ -f "$cand" ] && [ -x "$cand" ]; then
+        echo "$cand"
+        return 0
+      fi
+    done
+    dir=$(dirname "$dir")
+    i=$((i + 1))
+  done
+}
+
+darwin_main_exe() {
+  local mac cand
+  mac="$1/Contents/MacOS"
+  [ -d "$mac" ] || return 0
+  for cand in "$mac"/*; do
+    [ -f "$cand" ] && [ -x "$cand" ] || continue
+    case "$cand" in *Helper*|*helper*) continue ;; esac
+    echo "$cand"
+    return 0
+  done
+}
+
+pids_for_exe() {
+  local want="$1" pid exe
+  want=$(canon "$want")
+  [ -n "$want" ] || return 0
+  if [ "$IS_DARWIN" -eq 1 ]; then
+    command -v lsof >/dev/null 2>&1 || return 0
+    lsof -t -- "$want" 2>/dev/null | while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      exe=$(lsof -a -p "$pid" -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -n 1)
+      [ -n "$exe" ] || continue
+      [ "$(canon "$exe")" = "$want" ] && echo "$pid"
+    done
+    return 0
+  fi
+  for pid in /proc/[0-9]*; do
+    pid=${pid#/proc/}
+    exe=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
+    exe=${exe%" (deleted)"}
+    [ "$(canon "$exe")" = "$want" ] && echo "$pid"
+  done
+}
+
+kill_exe() {
+  local exe="$1" pid
+  [ -n "$exe" ] || return 0
+  is_editor_exe "$exe" && return 0
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    in_self_tree "$pid" && continue
+    kill "$pid" 2>/dev/null || true
+  done <<EOF
+$(pids_for_exe "$exe")
+EOF
+}
+
+# Закрыть только процессы, чей исполняемый файл — занятая цель или её desktop/IDE.
+# RELAUNCH — что открыть снова после успешного патча.
+stop_busy_files() {
+  local f owner exe
+  RELAUNCH=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    file_busy "$f" || continue
+    kill_exe "$f"
+    owner=$(owner_app "$f")
+    [ -n "$owner" ] || continue
+    if [ "$IS_DARWIN" -eq 1 ]; then
+      exe=$(darwin_main_exe "$owner")
+      kill_exe "$exe"
+    else
+      kill_exe "$owner"
+    fi
+    case "$NL$RELAUNCH" in
+      *"$NL$owner$NL"*) ;;
+      *) RELAUNCH="$RELAUNCH$owner$NL" ;;
+    esac
+  done <<EOF
+$1
+EOF
+}
+
+relaunch_apps() {
+  local app
+  while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    if [ "$IS_DARWIN" -eq 1 ]; then
+      open "$app" >/dev/null 2>&1 || true
+    else
+      nohup "$app" >/dev/null 2>&1 &
+    fi
+  done <<EOF
+$RELAUNCH
+EOF
 }
 
 confirm() {
@@ -542,8 +791,8 @@ apply_one() {
   kind=$(kind_of "$f")
   if [ "$kind" != "$want" ]; then
     case "$kind" in
-      patched)   [ "$mode" = "patch" ]   && dim "  пропускаю (уже пропатчен): $(tilde "$f")" ;;
-      unpatched) [ "$mode" = "unpatch" ] && dim "  пропускаю (уже стоковый): $(tilde "$f")" ;;
+      patched)   [ "$mode" = "patch" ] && [ -z "${AG_WATCH:-}" ] && dim "  пропускаю (уже пропатчен): $(tilde "$f")" ;;
+      unpatched) [ "$mode" = "unpatch" ] && [ -z "${AG_WATCH:-}" ] && dim "  пропускаю (уже стоковый): $(tilde "$f")" ;;
       missing)   warn "сигнатуры нет, не трогаю: $(tilde "$f")" ;;
       stacked)   err  "старый JS-патч в $(tilde "$f") — переустанови IDE" ; failed=$((failed+1)) ;;
       *)         err  "не читается: $(tilde "$f")" ; failed=$((failed+1)) ;;
@@ -607,24 +856,27 @@ EOF
     return 1
   fi
 
-  local live; live=$(running_apps)
-  if [ -n "$live" ]; then
-    warn "Сейчас запущено:"
-    while IFS= read -r b; do [ -n "$b" ] && dim "      $(tilde "$b")"; done <<EOF
-$live
+  RELAUNCH=""
+  local busy=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    kind=$(kind_of "$f"); [ "$kind" = "$want" ] || continue
+    if file_busy "$f"; then
+      busy="$busy$f$NL"
+    fi
+  done <<EOF
+$(all_targets)
+EOF
+  if [ -n "$busy" ]; then
+    warn "Часть файлов занята запущенным Antigravity."
+    while IFS= read -r f; do [ -n "$f" ] && dim "      $(tilde "$f")"; done <<EOF
+$busy
 EOF
     warn "Правка файлов работающего приложения может его уронить."
     confirm "Закрыть Antigravity и продолжить?" || { info "Отменено."; return 1; }
-    if [ "$IS_DARWIN" -eq 1 ]; then
-      while IFS= read -r b; do [ -n "$b" ] && pkill -f "$b/Contents/MacOS/" 2>/dev/null; done <<EOF
-$live
-EOF
-    else
-      pkill -f -i 'Antigravity|antigravity-ide' 2>/dev/null
-    fi
+    stop_busy_files "$busy"
     sleep 2
   fi
-  stop_servers
 
   while IFS= read -r f; do
     [ -n "$f" ] && apply_one "$mode" "$f"
@@ -638,8 +890,19 @@ EOF
 $bundles
 EOF
 
+  if [ "$mode" = "patch" ] && [ "$failed" -eq 0 ] && [ -n "$RELAUNCH" ]; then
+    local still=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      file_busy "$f" && still=1
+    done <<EOF
+$busy
+EOF
+    [ "$still" -eq 0 ] && relaunch_apps
+  fi
+
   if [ "$changed" -eq 0 ] && [ "$failed" -eq 0 ]; then
-    info "Менять нечего — всё уже в нужном состоянии."
+    [ -n "${AG_WATCH:-}" ] || info "Менять нечего — всё уже в нужном состоянии."
   else
     info "Изменено файлов: $changed, ошибок: $failed"
     if [ "$mode" = "patch" ] && [ "$changed" -gt 0 ]; then
@@ -653,8 +916,209 @@ EOF
   [ "$failed" -eq 0 ]
 }
 
+# ------------------------------------------------------------------ сторож
+file_sig() {
+  local f mt
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ "$IS_DARWIN" -eq 1 ]; then mt=$(stat -f '%m %z' "$f" 2>/dev/null)
+    else mt=$(stat -c '%Y %s' "$f" 2>/dev/null)
+    fi
+    printf '%s %s\n' "$f" "$mt"
+  done <<EOF
+$(all_targets)
+EOF
+}
+
+needs_patch() {
+  local f k
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    k=$(kind_of "$f")
+    [ "$k" = "unpatched" ] && return 0
+  done <<EOF
+$(all_targets)
+EOF
+  return 1
+}
+
+installer_busy() {
+  local f d
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    d=$(dirname "$f")
+    [ -f "$d/.agy-install.lock" ] && return 0
+    compgen -G "$d/agy.tmp.*" >/dev/null && return 0
+  done <<EOF
+$(all_targets)
+EOF
+  return 1
+}
+
+load_targets() {
+  if [ "$#" -gt 0 ]; then
+    use_only_paths "$@"
+  else
+    collect_candidates
+  fi
+}
+
+watch_main() {
+  local state sig prev="" skip=0 clean="" once="${AG_WATCH_ONCE:-}"
+  state="${XDG_STATE_HOME:-$HOME/.local/state}/ag-patcher"
+  mkdir -p "$state"
+  if [ "$once" != 1 ]; then
+    local pidfile="$state/watch.pid" old
+    if [ -f "$pidfile" ]; then
+      old=$(cat "$pidfile" 2>/dev/null || true)
+      if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
+        info "Сторож уже запущен (pid $old)"
+        return 0
+      fi
+    fi
+    echo $$ > "$pidfile"
+    trap 'rm -f "$pidfile"' EXIT
+  fi
+  export AG_YES=1
+  export AG_WATCH=1
+  local last_scan=0 now
+  while true; do
+    now=$(date +%s)
+    # Полный обход $HOME дорогой. Между обходами смотрим mtime уже найденных файлов.
+    if [ "$once" = 1 ] || [ $((now - last_scan)) -ge 30 ]; then
+      load_targets "$@"
+      last_scan=$now
+    fi
+    if installer_busy; then
+      [ "$once" = 1 ] && return 0
+      sleep 5
+      continue
+    fi
+    if [ "$once" = 1 ]; then
+      run_patch patch
+      return $?
+    fi
+    sig=$(file_sig)
+    if [ -n "$prev" ] && [ "$sig" != "$prev" ]; then
+      prev=$sig
+      skip=1
+      clean=""
+    elif [ "$skip" -gt 0 ]; then
+      prev=$sig
+      skip=0
+    else
+      prev=$sig
+      if [ "$sig" != "$clean" ]; then
+        if needs_patch; then
+          run_patch patch && clean=$sig
+        else
+          clean=$sig
+        fi
+      fi
+    fi
+    sleep 5
+  done
+}
+
+install_watch() {
+  local self unit plist domain
+  self=$(canon "$0")
+  if [ "$IS_DARWIN" -eq 1 ]; then
+    plist="$HOME/Library/LaunchAgents/com.ag.patcher.plist"
+    mkdir -p "$(dirname "$plist")"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.ag.patcher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$self</string>
+    <string>watch</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AG_YES</key><string>1</string>
+  </dict>
+</dict>
+</plist>
+EOF
+    domain="gui/$(id -u)"
+    launchctl bootout "$domain" "$plist" >/dev/null 2>&1 || true
+    if launchctl bootstrap "$domain" "$plist" >/dev/null 2>&1 || launchctl load -w "$plist" >/dev/null 2>&1; then
+      ok "Автозапуск включён: $(tilde "$plist")"
+    else
+      err "launchctl не загрузил агент"
+      return 1
+    fi
+  else
+    unit="$HOME/.config/systemd/user/ag-patcher.service"
+    mkdir -p "$(dirname "$unit")"
+    cat > "$unit" <<EOF
+[Unit]
+Description=Antigravity patcher watch
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash "$self" watch
+Restart=on-failure
+Environment=AG_YES=1
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    if systemctl --user enable --now ag-patcher.service; then
+      ok "Автозапуск включён: $(tilde "$unit")"
+    else
+      err "systemctl --user не включил ag-patcher.service"
+      return 1
+    fi
+  fi
+  info "Пока файл занят, сторож закрывает держащий его процесс и окно Antigravity или IDE, патчит и открывает его снова."
+}
+
+uninstall_watch() {
+  local unit plist domain
+  if [ "$IS_DARWIN" -eq 1 ]; then
+    plist="$HOME/Library/LaunchAgents/com.ag.patcher.plist"
+    domain="gui/$(id -u)"
+    launchctl bootout "$domain" "$plist" >/dev/null 2>&1 || launchctl unload "$plist" >/dev/null 2>&1 || true
+    rm -f "$plist"
+  else
+    unit="$HOME/.config/systemd/user/ag-patcher.service"
+    systemctl --user disable --now ag-patcher.service >/dev/null 2>&1 || true
+    rm -f "$unit"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+  ok "Автозапуск выключен."
+}
+
+run_paths_or_scan() {
+  if [ "$#" -gt 0 ]; then
+    use_only_paths "$@"
+    if [ -z "$CANDIDATES" ] && [ -z "$JS_CANDIDATES" ]; then
+      err "Ничего не найдено."
+      return 1
+    fi
+    say ""
+    report
+    say ""
+    return 0
+  fi
+  scan
+}
+
 # ------------------------------------------------------------------ main
-case "$OS" in Darwin|Linux) ;; *) err "Только macOS и Linux."; exit 1 ;; esac
+case "$OS" in Darwin|Linux) ;; *) err "Только macOS и Linux. На Windows: powershell -File ag_patcher.ps1"; exit 1 ;; esac
 command -v perl >/dev/null || { err "Нужен perl (штатный в macOS и Ubuntu)."; exit 1; }
 
 scan() {
@@ -667,7 +1131,7 @@ scan() {
     else
       warn "Ожидаются: /opt/Antigravity, /usr/share/antigravity, ~/.local/share/Antigravity,"
     fi
-    warn "CLI ~/.gemini/bin/agy (его ставит и VS Code-расширение google.google-antigravity)."
+    warn "CLI ~/.local/bin/agy или ~/.gemini/bin/agy (его ставит и VS Code-расширение)."
     return 1
   fi
   say ""
@@ -677,16 +1141,37 @@ scan() {
 }
 
 case "${1:-}" in
-  patch)   scan || exit 1; run_patch patch;   exit $? ;;
-  unpatch) scan || exit 1; run_patch unpatch; exit $? ;;
-  status)  scan; exit $? ;;
+  patch)
+    shift
+    run_paths_or_scan "$@" || exit 1
+    run_patch patch
+    exit $? ;;
+  unpatch)
+    shift
+    run_paths_or_scan "$@" || exit 1
+    run_patch unpatch
+    exit $? ;;
+  status)
+    shift
+    run_paths_or_scan "$@"
+    exit $? ;;
+  watch)
+    shift
+    watch_main "$@"
+    exit $? ;;
+  install-watch) install_watch; exit $? ;;
+  uninstall-watch) uninstall_watch; exit $? ;;
   -h|--help|help)
-    say "Использование: bash $0 [patch|unpatch|status]"
-    say "  patch    — пропатчить все найденные бинари и JS IDE"
-    say "  unpatch  — откатить патч"
-    say "  status   — только показать состояние"
-    say "  без аргументов — интерактивное меню"
-    say "Нужны bash и perl. macOS и Linux."
+    say "Использование: bash $0 [patch|unpatch|status|watch|install-watch|uninstall-watch] [файлы...]"
+    say "  patch            — пропатчить все найденные бинари и JS IDE"
+    say "  unpatch          — откатить патч"
+    say "  status           — только показать состояние"
+    say "  watch            — тихий цикл в этом терминале"
+    say "  install-watch    — автозапуск при входе (systemd --user или LaunchAgent)"
+    say "  uninstall-watch  — убрать автозапуск"
+    say "  без аргументов   — интерактивное меню"
+    say "Лишние пути вместо поиска. AG_ROOT — дополнительный каталог."
+    say "Нужны bash и perl. macOS и Linux. Windows: ag_patcher.ps1."
     exit 0 ;;
   "") ;;
   *) err "Неизвестная команда: $1 (см. --help)"; exit 1 ;;
@@ -697,6 +1182,9 @@ while true; do
   say "===== Antigravity patcher (macOS / Linux) ====="
   say " 1) Пропатчить всё найденное"
   say " 2) Откатить патч"
+  say " 3) Сторож в этом терминале"
+  say " 4) Включить автозапуск при входе"
+  say " 5) Выключить автозапуск"
   say " 0) Выход"
   printf "Выбор: "
   read -r choice || { say ""; exit 0; }
@@ -704,6 +1192,9 @@ while true; do
   case "$choice" in
     1) run_patch patch;   say ""; scan ;;
     2) run_patch unpatch; say ""; scan ;;
+    3) watch_main; exit $? ;;
+    4) install_watch; say "" ;;
+    5) uninstall_watch; say "" ;;
     0) exit 0 ;;
     *) warn "Неизвестный пункт меню"; say "" ;;
   esac
